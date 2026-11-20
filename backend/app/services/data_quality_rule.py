@@ -28,7 +28,12 @@ class DataQualityRuleService(BaseModuleService):
         super().__init__()
         self._validation_history: list[dict[str, Any]] = []
 
-    def validate_record(self, record: dict[str, Any], source_module: str = "") -> dict[str, Any]:
+    def validate_record(
+        self,
+        record: dict[str, Any],
+        source_module: str = "",
+        allowed_sources: list[str] | None = None,
+    ) -> dict[str, Any]:
         """对单条记录执行质量校验。
 
         校验流程：
@@ -37,17 +42,29 @@ class DataQualityRuleService(BaseModuleService):
         3. 检查数值范围（阈值上下界）
         4. 根据阻断策略决定是否拒绝
 
+        Args:
+            allowed_sources: 多规则转换数据集分版本质检时传入，仅采用
+                「数据来源」命中该清单的规则（清单通常含规则编号、规则ID
+                与 ALL/* 等通用来源）；不传时保持按 source_module 的历史匹配。
+
         Returns:
             { passed: bool, checks: int, failed: int, details: list, score: int }
         """
         rules = json_store.get_all(self.MODULE)
-        matching = [
-            r for r in rules
-            if r.get("status") == "已生效"
-            and (str(r.get("数据来源", "")) in (source_module, "", "ALL", "*")
-                 or source_module == ""
-                 or not source_module)
-        ]
+        if allowed_sources is not None:
+            matching = [
+                r for r in rules
+                if r.get("status") == "已生效"
+                and str(r.get("数据来源", "")) in {str(s) for s in allowed_sources}
+            ]
+        else:
+            matching = [
+                r for r in rules
+                if r.get("status") == "已生效"
+                and (str(r.get("数据来源", "")) in (source_module, "", "ALL", "*")
+                     or source_module == ""
+                     or not source_module)
+            ]
 
         if not matching:
             return {"passed": True, "checks": 0, "failed": 0, "details": [], "score": 100}

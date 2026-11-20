@@ -16,7 +16,9 @@
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/multi_transform.py 多规则批量转换数据集接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
+│   ├── app/services/multi_transform.py 多规则批量转换（多选规则/版本/血缘/质检阻断）
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
@@ -76,6 +78,31 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 多规则批量转换数据集
+
+同一来源批次一次选择多套转换规则（多选规则），为每套规则生成独立的规则版本成品，
+后端落在 `app/services/multi_transform.py`，前端页面为「多规则转换数据集」
+（路由 `/multi-transform-datasets`）。核心约定：
+
+- **幂等提交**：按 `批次编号 + 源数据指纹 + 规则集合指纹` 去重；同批同源重提只复用
+  既有版本，不新增成品；数据或规则集合变化则拒绝覆盖。
+- **断点续做**：转换逐行落盘（`multi_transform_row`），中断后 `resume` 从未完成
+  版本的断点行继续，已完成的行与版本不重跑；源记录在批次级与行级双留存。
+- **字段血缘**：每行成品记录目标字段 → 源路径/源值/转换函数/成品值，可按
+  版本+源行号回查实际字段来源；字段映射支持 `{"目标字段": {"path": "...", "function": "..."}}`
+  字段级转换函数。
+- **分版本质检**：质量校验跨模块读取多规则数据集，按版本执行；阻断结论回写
+  待复核清单（`multi_transform_review`），存在阻断待复核项的版本不可发布。
+- **失败行补做**：映射修正后对同版本失败行原地重做，不产生新版本；补做后需重新质检。
+- **跨映射对照**：按源行核对两套规则的成品字段差异与来源差异。
+
+主要接口前缀 `/api/multi-transform`：`POST /batches`（提交）、
+`POST /batches/{no}/run|resume`（执行/续做）、
+`GET /batches/{no}/availability`（可领取版本与等待原因）、
+`GET /batches/{no}/compare`（跨映射对照）、
+`POST /versions/{id}/quality-check|publish|repair`（质检/发布/补做）、
+`GET /versions/{id}/lineage`（血缘回查）。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

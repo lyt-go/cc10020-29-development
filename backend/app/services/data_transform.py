@@ -49,45 +49,113 @@ class DataTransformService(BaseModuleService):
         Returns:
             { ok: bool, data: dict, errors: list, fields_transformed: int }
         """
+        outcome = self.transform_with_lineage(rule_id, source_data)
+        return {
+            "ok": outcome["ok"],
+            "data": outcome["data"],
+            "errors": outcome["errors"],
+            "fields_transformed": outcome["fields_transformed"],
+            "total_fields": outcome["total_fields"],
+            "quality_check": outcome["quality_check"],
+        }
+
+    def transform_with_lineage(self, rule_id: int, source_data: dict[str, Any]) -> dict[str, Any]:
+        """带字段级血缘的转换：每个目标字段都记录实际取值的源路径与处理过程。
+
+        血缘条目 lineage[] 结构：
+            target_field  目标字段名
+            source_path   规则声明的源字段路径
+            source_value  实际取到的源值（回查字段来源的依据）
+            function      实际应用的转换函数
+            output_value  最终写入成品的值
+            status        success / defaulted / skipped / error
+            error         失败原因（status 非 success 时）
+
+        Returns:
+            { ok, data, errors, fields_transformed, total_fields, lineage, rule_snapshot, quality_check }
+        """
         rule = json_store.get_by_id(self.MODULE, rule_id)
         if rule is None:
-            return {"ok": False, "data": {}, "errors": ["转换规则不存在"], "fields_transformed": 0}
+            return {
+                "ok": False, "data": {}, "errors": ["转换规则不存在"],
+                "fields_transformed": 0, "total_fields": 0, "lineage": [],
+                "rule_snapshot": None, "quality_check": {"passed": False, "checks": 0},
+            }
 
         if rule.get("status") != "已生效":
-            return {"ok": False, "data": {}, "errors": ["转换规则未生效"], "fields_transformed": 0}
+            return {
+                "ok": False, "data": {}, "errors": ["转换规则未生效"],
+                "fields_transformed": 0, "total_fields": 0, "lineage": [],
+                "rule_snapshot": None, "quality_check": {"passed": False, "checks": 0},
+            }
 
         field_mapping = self._parse_mapping(str(rule.get("字段映射", "{}")))
         transform_func = str(rule.get("转换函数", "passthrough"))
         default_filler = str(rule.get("默认值填充", "使用默认值"))
         error_policy = str(rule.get("异常策略", "跳过"))
 
-        result = {}
-        errors = []
+        result: dict[str, Any] = {}
+        lineage: list[dict[str, Any]] = []
+        errors: list[str] = []
         transformed = 0
+        hard_errors = 0
 
-        for target_field, source_path in field_mapping.items():
+        for target_field, mapping_spec in field_mapping.items():
+            source_path, field_function = self._mapping_spec(mapping_spec)
+            # 字段级函数优先；未声明时回退规则级转换函数
+            active_function = field_function or transform_func
+            entry: dict[str, Any] = {
+                "target_field": target_field,
+                "source_path": source_path,
+                "source_value": None,
+                "function": active_function,
+                "output_value": None,
+                "status": "success",
+                "error": "",
+            }
             try:
                 source_value = self._extract_value(source_data, source_path)
-                converted = self._apply_function(transform_func, source_value)
+                entry["source_value"] = source_value
+                converted = self._apply_function(active_function, source_value)
                 result[target_field] = converted
+                entry["output_value"] = converted
                 transformed += 1
             except (KeyError, ValueError, TypeError) as e:
+                entry["status"] = "error"
+                entry["error"] = str(e)
                 if error_policy == "使用默认值":
-                    result[target_field] = self._get_default_value(target_field, rule)
+                    default_value = self._get_default_value(target_field, rule)
+                    result[target_field] = default_value
+                    entry["output_value"] = default_value
+                    entry["status"] = "defaulted"
                 elif error_policy == "报错":
                     errors.append(f"字段 {target_field}: {e}")
+                    hard_errors += 1
                 else:
+                    # 跳过策略：记录但不阻断整行
                     errors.append(f"字段 {target_field} 跳过: {e}")
+                    entry["status"] = "skipped"
+            lineage.append(entry)
 
         # 质量校验（跨模块：data_quality_rule）
         quality_check = self._run_quality_checks(rule_id, result)
 
         return {
-            "ok": len(errors) == 0 or error_policy == "跳过",
+            "ok": hard_errors == 0,
             "data": result,
             "errors": errors,
             "fields_transformed": transformed,
             "total_fields": len(field_mapping),
+            "lineage": lineage,
+            "rule_snapshot": {
+                "rule_id": rule_id,
+                "规则编号": rule.get("规则编号"),
+                "字段映射": field_mapping,
+                "转换函数": transform_func,
+                "异常策略": error_policy,
+                "默认值填充": default_filler,
+                "规则版本": rule.get("规则版本"),
+            },
             "quality_check": quality_check,
         }
 
@@ -96,10 +164,11 @@ class DataTransformService(BaseModuleService):
 
         支持格式：
         - JSON: {"目标字段": "源字段路径"}
+        - JSON 字段级配置: {"目标字段": {"path": "源字段路径", "function": "to_integer"}}
         - 简单: "field1->target1,field2->target2"
         """
         try:
-            return json.loads(mapping_str)
+            parsed = json.loads(mapping_str)
         except json.JSONDecodeError:
             result = {}
             for part in mapping_str.split(","):
@@ -107,6 +176,23 @@ class DataTransformService(BaseModuleService):
                     src, tgt = part.split("->", 1)
                     result[tgt.strip()] = src.strip()
             return result if result else {"_raw": "payload"}
+
+        normalized: dict[str, Any] = {}
+        for target, spec in parsed.items():
+            if isinstance(spec, dict):
+                normalized[target] = {
+                    "path": str(spec.get("path", "")),
+                    "function": str(spec.get("function", "passthrough")),
+                }
+            else:
+                normalized[target] = str(spec)
+        return normalized
+
+    def _mapping_spec(self, spec: Any) -> tuple[str, str | None]:
+        """把单个映射规格统一拆成 (源路径, 字段级转换函数)。"""
+        if isinstance(spec, dict):
+            return str(spec.get("path", "")), str(spec.get("function") or "") or None
+        return str(spec), None
 
     def _extract_value(self, data: dict[str, Any], path: str) -> Any:
         """从嵌套数据中提取指定路径的值。
